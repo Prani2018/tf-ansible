@@ -1,0 +1,205 @@
+---
+- name: Deploy Java Application to Tomcat
+  hosts: tomcat_servers
+  become: yes
+  vars:
+    tomcat_version: "9.0.82"
+    tomcat_user: tomcat
+    tomcat_group: tomcat
+    tomcat_home: /opt/tomcat
+    java_version: "11"
+    app_war_src: "../java-app/target/sample-webapp.war"
+    app_war_dest: "{{ tomcat_home }}/webapps/sample-webapp.war"
+
+  tasks:
+    - name: Update system packages
+      yum:
+        name: "*"
+        state: latest
+        update_cache: yes
+
+    - name: Install Java JDK
+      yum:
+        name: "java-{{ java_version }}-openjdk-devel"
+        state: present
+
+    - name: Verify Java installation
+      command: java -version
+      register: java_version_output
+      changed_when: false
+
+    - name: Display Java version
+      debug:
+        msg: "{{ java_version_output.stderr }}"
+
+    - name: Create Tomcat group
+      group:
+        name: "{{ tomcat_group }}"
+        state: present
+
+    - name: Create Tomcat user
+      user:
+        name: "{{ tomcat_user }}"
+        group: "{{ tomcat_group }}"
+        home: "{{ tomcat_home }}"
+        shell: /bin/false
+        state: present
+
+    - name: Check if Tomcat is already installed
+      stat:
+        path: "{{ tomcat_home }}/bin/catalina.sh"
+      register: tomcat_installed
+
+    - name: Download Tomcat
+      get_url:
+        url: "https://archive.apache.org/dist/tomcat/tomcat-9/v{{ tomcat_version }}/bin/apache-tomcat-{{ tomcat_version }}.tar.gz"
+        dest: /tmp/tomcat.tar.gz
+        mode: '0644'
+      when: not tomcat_installed.stat.exists
+
+    - name: Create Tomcat directory
+      file:
+        path: "{{ tomcat_home }}"
+        state: directory
+        owner: "{{ tomcat_user }}"
+        group: "{{ tomcat_group }}"
+
+    - name: Extract Tomcat archive
+      unarchive:
+        src: /tmp/tomcat.tar.gz
+        dest: "{{ tomcat_home }}"
+        remote_src: yes
+        extra_opts: [--strip-components=1]
+        owner: "{{ tomcat_user }}"
+        group: "{{ tomcat_group }}"
+      when: not tomcat_installed.stat.exists
+
+    - name: Set permissions on Tomcat directories
+      file:
+        path: "{{ tomcat_home }}/{{ item }}"
+        owner: "{{ tomcat_user }}"
+        group: "{{ tomcat_group }}"
+        mode: '0755'
+        recurse: yes
+      loop:
+        - bin
+        - lib
+        - conf
+        - webapps
+        - logs
+        - temp
+        - work
+
+    - name: Make Tomcat scripts executable
+      file:
+        path: "{{ tomcat_home }}/bin/{{ item }}"
+        mode: '0755'
+      loop:
+        - catalina.sh
+        - startup.sh
+        - shutdown.sh
+
+    - name: Configure Tomcat users
+      template:
+        src: templates/tomcat-users.xml.j2
+        dest: "{{ tomcat_home }}/conf/tomcat-users.xml"
+        owner: "{{ tomcat_user }}"
+        group: "{{ tomcat_group }}"
+        mode: '0600'
+      notify: restart tomcat
+
+    - name: Configure Tomcat manager context
+      copy:
+        dest: "{{ tomcat_home }}/webapps/manager/META-INF/context.xml"
+        content: |
+          <?xml version="1.0" encoding="UTF-8"?>
+          <Context antiResourceLocking="false" privileged="true" >
+            <Valve className="org.apache.catalina.valves.RemoteAddrValve"
+                   allow=".*" />
+            <Manager sessionAttributeValueClassNameFilter="java\.lang\.(?:Boolean|Integer|Long|Number|String)|org\.apache\.catalina\.filters\.CsrfPreventionFilter\$LruCache(?:\$1)?|java\.util\.(?:Linked)?HashMap"/>
+          </Context>
+        owner: "{{ tomcat_user }}"
+        group: "{{ tomcat_group }}"
+        mode: '0644'
+      when: tomcat_installed.stat.exists or not tomcat_installed.stat.exists
+
+    - name: Create Tomcat systemd service
+      template:
+        src: templates/tomcat.service.j2
+        dest: /etc/systemd/system/tomcat.service
+        mode: '0644'
+      notify: reload systemd
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable and start Tomcat service
+      systemd:
+        name: tomcat
+        enabled: yes
+        state: started
+
+    - name: Wait for Tomcat to start
+      wait_for:
+        port: 8080
+        delay: 10
+        timeout: 60
+
+    - name: Check if WAR file exists
+      local_action:
+        module: stat
+        path: "{{ app_war_src }}"
+      register: war_file
+      become: no
+
+    - name: Fail if WAR file doesn't exist
+      fail:
+        msg: "WAR file not found at {{ app_war_src }}. Please build the application first with 'mvn clean package'"
+      when: not war_file.stat.exists
+
+    - name: Copy WAR file to Tomcat
+      copy:
+        src: "{{ app_war_src }}"
+        dest: "{{ app_war_dest }}"
+        owner: "{{ tomcat_user }}"
+        group: "{{ tomcat_group }}"
+        mode: '0644'
+      notify: restart tomcat
+
+    - name: Wait for application deployment
+      wait_for:
+        path: "{{ tomcat_home }}/webapps/sample-webapp"
+        state: present
+        timeout: 60
+      ignore_errors: yes
+
+    - name: Open firewall for Tomcat (if firewalld is running)
+      firewalld:
+        port: 8080/tcp
+        permanent: yes
+        state: enabled
+        immediate: yes
+      ignore_errors: yes
+
+    - name: Display deployment information
+      debug:
+        msg:
+          - "=========================================="
+          - "Tomcat deployment completed successfully!"
+          - "=========================================="
+          - "Application URL: http://{{ ansible_host }}:8080/sample-webapp/"
+          - "Tomcat Manager: http://{{ ansible_host }}:8080/manager/html"
+          - "Username: admin"
+          - "Password: admin123"
+          - "=========================================="
+
+  handlers:
+    - name: reload systemd
+      systemd:
+        daemon_reload: yes
+
+    - name: restart tomcat
+      systemd:
+        name: tomcat
+        state: restarted
